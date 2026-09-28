@@ -1,6 +1,6 @@
 # StarPlay
 
-轻量 Rust 终端音乐播放器，面向 Windows Terminal / CMD。默认扫描当前目录，直接播放本地音乐；不上传音频、不修改音乐文件。
+轻量 Rust 终端音乐播放器，支持 Windows（Windows Terminal / CMD）、Linux 和 macOS 终端。默认扫描当前目录，直接播放本地音乐；不上传音频、不修改音乐文件。
 
 ## 特性
 
@@ -14,28 +14,34 @@
 
 ## 构建与安装
 
-需要 Rust 工具链；Windows MSVC 工具链还需要 Visual Studio C++ 构建工具。
+需要 Rust stable 工具链。各系统的额外依赖：
 
-```powershell
+- **Windows**：MSVC 工具链需要 Visual Studio C++ 构建工具。
+- **Linux**：ALSA 开发文件，Debian/Ubuntu 执行 `sudo apt install libasound2-dev pkg-config`，Fedora 执行 `sudo dnf install alsa-lib-devel`。
+- **macOS**：无额外依赖。
+
+```sh
 git clone <仓库地址>
 cd starplay
 cargo build --release --locked
 ```
 
-生成的程序为 `target\release\starplay.exe`。也可以直接安装到 Cargo 目录：
+生成的程序为 `target/release/starplay`（Windows 为 `target\release\starplay.exe`）。也可以直接安装到 Cargo 目录：
 
-```powershell
+```sh
 cargo install --path . --locked
 ```
+
+Windows 平台经过完整交互验证；Linux 和 macOS 由 CI 保证编译与全部测试通过，实际终端交互体验如有问题欢迎反馈。
 
 ## 快速开始
 
 在音乐目录中启动，或显式传入文件和目录：
 
-```powershell
+```sh
 starplay                          # 播放当前目录
 starplay "song.mp3"               # 播放指定文件
-starplay --recursive --volume 40 "D:\Music"
+starplay --recursive --volume 40 "~/Music"
 starplay "a.mp3" "b.mp3" "我的歌单.m3u8"
 ```
 
@@ -107,10 +113,10 @@ visual=spectrum
 
 ## 命令行模式
 
-```powershell
+```sh
 starplay --list                          # 只列出歌曲，无需终端或声卡
 starplay --check                         # 完整消费每首歌的解码输出，无需声卡
-starplay --list --recursive "D:\Music"   # 递归列出指定目录
+starplay --list --recursive "~/Music"    # 递归列出指定目录
 starplay --list -- "-song.mp3"           # 文件名以短横线开头时用 -- 分隔
 starplay --help
 ```
@@ -127,12 +133,14 @@ starplay --help
 
 ## 开发
 
-```powershell
+```sh
 cargo fmt --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --release --locked
 ```
+
+GitHub Actions 在 Windows、Ubuntu 和 macOS 三个平台运行 `cargo test --locked`。
 
 测试覆盖参数解析、排序/递归/去重、中文路径、循环边界、显示宽度、WAV 解码、损坏文件、错误退出码、配置往返、特效分析（FFT 频率定位、脉冲触发与衰减、音量联动）以及完整布局与差分绘制。交互逻辑使用模拟后端和内存终端输出验证，不依赖声卡；依赖缓存后可加 `--offline` 运行。
 
