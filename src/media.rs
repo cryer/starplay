@@ -3,7 +3,15 @@
 //! The player deliberately keeps this dependency-free. Metadata is best effort:
 //! malformed tags fall back to the file name and never prevent playback.
 
-use std::{fs, path::Path, time::Duration};
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+    time::Duration,
+};
+
+const MAX_TAG_BYTES: u64 = 1_048_576;
+const MAX_LYRIC_BYTES: u64 = 1_048_576;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Metadata {
@@ -13,19 +21,31 @@ pub struct Metadata {
 }
 
 pub fn metadata(path: &Path) -> Metadata {
-    let Ok(bytes) = fs::read(path) else {
+    let Ok(mut file) = File::open(path) else {
         return Metadata::default();
     };
-    let mut result = if bytes.starts_with(b"ID3") {
-        parse_id3v2(&bytes)
+    let mut head = Vec::new();
+    if (&mut file)
+        .take(MAX_TAG_BYTES)
+        .read_to_end(&mut head)
+        .is_err()
+    {
+        return Metadata::default();
+    }
+    let mut result = if head.starts_with(b"ID3") {
+        parse_id3v2(&head)
     } else {
         Metadata::default()
     };
     if result.title.is_none() || result.artist.is_none() || result.album.is_none() {
-        let tail = parse_id3v1(&bytes);
-        result.title = result.title.or(tail.title);
-        result.artist = result.artist.or(tail.artist);
-        result.album = result.album.or(tail.album);
+        // ID3v1 is a fixed 128-byte trailer; shorter files cannot carry one.
+        let mut tail = Vec::new();
+        if file.seek(SeekFrom::End(-128)).is_ok() && file.read_to_end(&mut tail).is_ok() {
+            let tag = parse_id3v1(&tail);
+            result.title = result.title.or(tag.title);
+            result.artist = result.artist.or(tag.artist);
+            result.album = result.album.or(tag.album);
+        }
     }
     result
 }
@@ -45,7 +65,7 @@ fn parse_id3v1(bytes: &[u8]) -> Metadata {
     let Some(tag) = bytes.get(bytes.len().saturating_sub(128)..) else {
         return Metadata::default();
     };
-    if tag.get(..3) != Some(b"TAG") {
+    if tag.len() != 128 || tag.get(..3) != Some(b"TAG") {
         return Metadata::default();
     }
     Metadata {
@@ -130,10 +150,20 @@ pub struct Lyrics {
 impl Lyrics {
     pub fn load(audio: &Path) -> Result<Self, String> {
         let path = audio.with_extension("lrc");
-        let bytes =
-            fs::read(&path).map_err(|e| format!("Cannot read '{}': {e}", path.display()))?;
-        let text = String::from_utf8(bytes)
-            .map_err(|_| format!("Lyrics '{}' are not UTF-8", path.display()))?;
+        let text = crate::playlist::read_bounded_utf8(&path, MAX_LYRIC_BYTES).map_err(|error| {
+            use crate::playlist::ReadError;
+            match error {
+                ReadError::Open(error) | ReadError::Read(error) => {
+                    format!("Cannot read '{}': {error}", path.display())
+                }
+                ReadError::TooLarge => format!(
+                    "Lyrics '{}' exceed the {} byte limit",
+                    path.display(),
+                    MAX_LYRIC_BYTES
+                ),
+                ReadError::Utf8 => format!("Lyrics '{}' are not UTF-8", path.display()),
+            }
+        })?;
         Ok(Self::parse(&text))
     }
 
@@ -159,11 +189,8 @@ impl Lyrics {
     }
 
     pub fn current(&self, position: Duration) -> Option<&str> {
-        self.lines
-            .iter()
-            .rev()
-            .find(|(time, _)| *time <= position)
-            .map(|(_, text)| text.as_str())
+        let index = self.lines.partition_point(|(time, _)| *time <= position);
+        Some(self.lines.get(index.checked_sub(1)?)?.1.as_str())
     }
 }
 
@@ -175,15 +202,21 @@ fn parse_timestamp(value: &str) -> Option<Duration> {
     if seconds >= 60 {
         return None;
     }
-    let fraction = fraction.next().unwrap_or("0");
-    let millis = match fraction.len() {
+    let decimal = fraction.next().unwrap_or("0");
+    if fraction.next().is_some() || !decimal.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let millis = match decimal.len() {
         0 => 0,
-        1 => fraction.parse::<u64>().ok()? * 100,
-        2 => fraction.parse::<u64>().ok()? * 10,
-        _ => fraction[..3].parse::<u64>().ok()?,
+        1 => decimal.parse::<u64>().ok()? * 100,
+        2 => decimal.parse::<u64>().ok()? * 10,
+        _ => decimal[..3].parse::<u64>().ok()?,
     };
     Some(Duration::from_millis(
-        minutes * 60_000 + seconds * 1_000 + millis,
+        minutes
+            .checked_mul(60_000)?
+            .checked_add(seconds * 1_000)?
+            .checked_add(millis)?,
     ))
 }
 
@@ -197,6 +230,25 @@ mod tests {
         assert_eq!(lyrics.current(Duration::from_millis(1200)), Some("one"));
         assert_eq!(lyrics.current(Duration::from_secs(3)), Some("one"));
         assert_eq!(lyrics.current(Duration::from_millis(3500)), Some("two"));
+    }
+
+    #[test]
+    fn id3v1_short_tag_is_ignored() {
+        for len in 3..128 {
+            let mut bytes = vec![0; len];
+            bytes[..3].copy_from_slice(b"TAG");
+            assert_eq!(parse_id3v1(&bytes), Metadata::default());
+        }
+    }
+
+    #[test]
+    fn malformed_lrc_timestamp_is_ignored() {
+        for stamp in ["00:01.2.3", "00:01.1中文", "18446744073709551615:00"] {
+            assert_eq!(parse_timestamp(stamp), None);
+        }
+        let lyrics = Lyrics::parse("[00:01.2.3]bad\n[00:02.3456]good");
+        assert_eq!(lyrics.current(Duration::from_secs(2)), None);
+        assert_eq!(lyrics.current(Duration::from_millis(2345)), Some("good"));
     }
 
     #[test]

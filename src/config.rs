@@ -1,15 +1,25 @@
 //! Versioned settings stored only at the path chosen by the caller (normally the launch directory).
-use crate::{player::Repeat, visualizer::VisualMode};
+use crate::{player::Repeat, playlist::{read_bounded_utf8, ReadError}, visualizer::VisualMode};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
 pub const FILE_NAME: &str = ".starplay.conf";
+pub const DEFAULT_VOLUME: u8 = 50;
 const MAX_FILE_SIZE: u64 = 16 * 1024;
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn parse_volume(value: &str) -> Option<u8> {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| value.parse::<u8>().ok())
+        .flatten()
+        .filter(|volume| *volume <= 100)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -21,7 +31,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            volume: 50,
+            volume: DEFAULT_VOLUME,
             repeat: Repeat::Off,
             visual_mode: VisualMode::Spectrum,
         }
@@ -54,19 +64,19 @@ pub fn load(path: &Path) -> Result<Settings, String> {
     if meta.len() > MAX_FILE_SIZE {
         return Err(config_error(path, "file exceeds the 16 KiB size limit"));
     }
-    let file = File::open(path)
-        .map_err(|error| config_error(path, format!("cannot open file: {error}")))?;
-    let mut bytes = Vec::new();
     // Bound the actual read as well: the file may have grown since the metadata check.
-    file.take(MAX_FILE_SIZE + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| config_error(path, format!("cannot read file: {error}")))?;
-    if bytes.len() as u64 > MAX_FILE_SIZE {
-        return Err(config_error(path, "file exceeds the 16 KiB size limit"));
-    }
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| config_error(path, "file must contain valid UTF-8 text"))?;
-    parse(text).map_err(|error| config_error(path, error))
+    let text = read_bounded_utf8(path, MAX_FILE_SIZE).map_err(|error| {
+        config_error(
+            path,
+            match error {
+                ReadError::Open(error) => format!("cannot open file: {error}"),
+                ReadError::Read(error) => format!("cannot read file: {error}"),
+                ReadError::TooLarge => "file exceeds the 16 KiB size limit".to_string(),
+                ReadError::Utf8 => "file must contain valid UTF-8 text".to_string(),
+            },
+        )
+    })?;
+    parse(&text).map_err(|error| config_error(path, error))
 }
 
 fn parse(text: &str) -> Result<Settings, String> {
@@ -101,41 +111,30 @@ fn parse(text: &str) -> Result<Settings, String> {
             }
             "version" => {}
             "volume" => {
-                settings.volume = value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit())
-                    .then(|| value.parse::<u8>().ok())
-                    .flatten()
-                    .filter(|volume| *volume <= 100)
-                    .ok_or_else(|| {
-                        format!("line {line_number}: volume must be an integer from 0 to 100")
-                    })?;
+                settings.volume = parse_volume(value).ok_or_else(|| {
+                    format!("line {line_number}: volume must be an integer from 0 to 100")
+                })?;
             }
             "repeat" => {
-                settings.repeat = match value {
-                    "off" => Repeat::Off,
-                    "all" => Repeat::All,
-                    "one" => Repeat::One,
-                    _ => {
-                        return Err(format!(
-                            "line {line_number}: repeat must be off, all or one"
-                        ));
-                    }
-                };
+                settings.repeat = [Repeat::Off, Repeat::All, Repeat::One]
+                    .into_iter()
+                    .find(|repeat| repeat.label() == value)
+                    .ok_or_else(|| {
+                        format!("line {line_number}: repeat must be off, all or one")
+                    })?;
             }
             "visual" => {
-                settings.visual_mode = match value {
-                    "spectrum" => VisualMode::Spectrum,
+                settings.visual_mode = [VisualMode::Spectrum, VisualMode::Pulse, VisualMode::Off]
+                    .into_iter()
+                    .find(|mode| mode.as_str() == value)
                     // Migrate retired effects without discarding other preferences.
-                    "waveform" | "stereo" | "field" => VisualMode::Spectrum,
-                    "pulse" => VisualMode::Pulse,
-                    "off" => VisualMode::Off,
-                    _ => {
-                        return Err(format!(
-                            "line {line_number}: visual must be spectrum, pulse or off"
-                        ));
-                    }
-                };
+                    .or(match value {
+                        "waveform" | "stereo" | "field" => Some(VisualMode::Spectrum),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        format!("line {line_number}: visual must be spectrum, pulse or off")
+                    })?;
             }
             _ => unreachable!(),
         }
@@ -150,19 +149,11 @@ fn serialize(settings: &Settings) -> Result<String, String> {
     if settings.volume > 100 {
         return Err("volume must be an integer from 0 to 100".into());
     }
-    let repeat = match settings.repeat {
-        Repeat::Off => "off",
-        Repeat::All => "all",
-        Repeat::One => "one",
-    };
-    let visual = match settings.visual_mode {
-        VisualMode::Spectrum => "spectrum",
-        VisualMode::Pulse => "pulse",
-        VisualMode::Off => "off",
-    };
     Ok(format!(
-        "version=1\nvolume={}\nrepeat={repeat}\nvisual={visual}\n",
-        settings.volume
+        "version=1\nvolume={}\nrepeat={}\nvisual={}\n",
+        settings.volume,
+        settings.repeat.label(),
+        settings.visual_mode.as_str()
     ))
 }
 

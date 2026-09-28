@@ -34,6 +34,14 @@ impl VisualMode {
             Self::Off => "OFF",
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spectrum => "spectrum",
+            Self::Pulse => "pulse",
+            Self::Off => "off",
+        }
+    }
 }
 
 /// Reused across frames, including resizes; rendering does not allocate a new grid each tick.

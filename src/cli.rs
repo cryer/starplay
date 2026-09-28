@@ -1,3 +1,4 @@
+use crate::config::{parse_volume, DEFAULT_VOLUME};
 use std::{ffi::OsString, path::PathBuf};
 
 pub const HELP: &str = "StarPlay - terminal music player
@@ -51,7 +52,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, String
     let mut options = Options {
         paths: Vec::new(),
         recursive: false,
-        volume: 50,
+        volume: DEFAULT_VOLUME,
         volume_explicit: false,
         no_config: false,
         mode: Mode::Play,
@@ -73,8 +74,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, String
                     .ok_or("--volume requires a number from 0 to 100.")?;
                 options.volume = value
                     .to_str()
-                    .and_then(|s| s.parse::<u8>().ok())
-                    .filter(|v| *v <= 100)
+                    .and_then(parse_volume)
                     .ok_or("--volume must be an integer from 0 to 100.")?;
                 options.volume_explicit = true;
             }

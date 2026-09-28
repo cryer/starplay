@@ -100,11 +100,15 @@ fn run() -> Result<(), String> {
             if options.volume_explicit {
                 settings.volume = options.volume;
             }
-            ui::run(tracks, &mut settings, &warning).map_err(|e| e.to_string())?;
+            let result = ui::run(tracks, &mut settings, &warning).map_err(|e| e.to_string());
             if save_config {
-                config::save(path, &settings)?;
+                // Persist the final settings even when the UI errored; the UI error wins.
+                if let Err(save_error) = config::save(path, &settings) {
+                    result?;
+                    return Err(save_error);
+                }
             }
-            Ok(())
+            result
         }
         _ => unreachable!(),
     }

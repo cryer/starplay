@@ -3,7 +3,7 @@ use crate::{
     library::Track,
 };
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
-use std::{fs::File, io::BufReader, path::Path, time::Duration};
+use std::{fs::File, io::BufReader, path::Path, sync::Arc, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Repeat {
@@ -45,6 +45,51 @@ fn decode(path: &Path) -> Result<Decoder<BufReader<File>>, String> {
     Decoder::new(BufReader::new(file)).map_err(|e| format!("Cannot decode {}: {e}", path.display()))
 }
 
+/// A decoder with its first sample buffered, so an empty file is detected without
+/// decoding twice; Source metadata is forwarded from the decoder.
+struct PeekedSource {
+    first: Option<i16>,
+    inner: Decoder<BufReader<File>>,
+}
+
+impl PeekedSource {
+    fn new(path: &Path) -> Result<Self, String> {
+        let mut inner = decode(path)?;
+        let first = inner.next();
+        Ok(Self { first, inner })
+    }
+}
+
+impl Iterator for PeekedSource {
+    type Item = i16;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.first.take().or_else(|| self.inner.next())
+    }
+}
+
+impl Source for PeekedSource {
+    fn current_frame_len(&self) -> Option<usize> {
+        self.inner
+            .current_frame_len()
+            .map(|len| len + usize::from(self.first.is_some()))
+    }
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
+    fn try_seek(&mut self, pos: Duration) -> Result<(), rodio::source::SeekError> {
+        // A seek moves past the start; the buffered first sample no longer applies.
+        self.inner.try_seek(pos)?;
+        self.first = None;
+        Ok(())
+    }
+}
+
 pub struct AudioInfo {
     pub channels: u16,
     pub sample_rate: u32,
@@ -78,7 +123,7 @@ pub struct Player {
     sink: Option<Sink>,
     handle: OutputStreamHandle,
     _stream: OutputStream,
-    pub tracks: Vec<Track>,
+    pub tracks: Arc<Vec<Track>>,
     pub current: Option<usize>,
     pub duration: Option<Duration>,
     pub volume: u8,
@@ -89,7 +134,7 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn new(tracks: Vec<Track>, volume: u8) -> Result<Self, String> {
+    pub fn new(tracks: Arc<Vec<Track>>, volume: u8) -> Result<Self, String> {
         let (stream, handle) = OutputStream::try_default()
             .map_err(|e| format!("Cannot open the default audio output device: {e}"))?;
         Ok(Self {
@@ -112,12 +157,10 @@ impl Player {
             .tracks
             .get(index)
             .ok_or("Track index is out of range.")?;
-        let mut source = decode(&track.path)?.peekable();
-        if source.peek().is_none() {
+        let source = PeekedSource::new(&track.path)?;
+        if source.first.is_none() {
             return Err("The file contains no playable audio samples.".into());
         }
-        // Decode again to retain Source metadata rather than buffering audio in memory.
-        let source = decode(&track.path)?;
         let duration = source.total_duration();
         let sink = Sink::try_new(&self.handle).map_err(|e| e.to_string())?;
         sink.pause();
@@ -189,18 +232,6 @@ impl Player {
         }
         sink.try_seek(target)
             .map_err(|e| format!("Seeking unavailable: {e}"))
-    }
-    pub fn skip(&mut self, forward: bool) -> Result<(), String> {
-        let count = self.tracks.len();
-        if count == 0 {
-            return Ok(());
-        }
-        let current = self.current.unwrap_or(0);
-        self.play(if forward {
-            (current + 1) % count
-        } else {
-            (current + count - 1) % count
-        })
     }
     /// Mark EOF without choosing the next track; navigation belongs to the worker.
     pub fn poll_finished(&mut self) -> bool {

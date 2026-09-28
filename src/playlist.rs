@@ -9,6 +9,27 @@ pub(crate) const MAX_BYTES: u64 = 1_048_576;
 pub(crate) const MAX_ENTRIES: usize = 10_000;
 pub(crate) const MAX_DEPTH: usize = 32;
 
+/// A bounded UTF-8 file read. The error names the failing stage so each caller
+/// keeps its own message wording.
+pub(crate) enum ReadError {
+    Open(io::Error),
+    Read(io::Error),
+    TooLarge,
+    Utf8,
+}
+
+pub(crate) fn read_bounded_utf8(path: &Path, max: u64) -> Result<String, ReadError> {
+    let file = fs::File::open(path).map_err(ReadError::Open)?;
+    let mut bytes = Vec::new();
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(ReadError::Read)?;
+    if bytes.len() as u64 > max {
+        return Err(ReadError::TooLarge);
+    }
+    String::from_utf8(bytes).map_err(|_| ReadError::Utf8)
+}
+
 /// Read a playlist's ordered, non-empty, non-comment entries.
 pub(crate) fn load(path: &Path) -> Result<Vec<PathBuf>, String> {
     let metadata = fs::metadata(path)
@@ -20,15 +41,13 @@ pub(crate) fn load(path: &Path) -> Result<Vec<PathBuf>, String> {
             MAX_BYTES
         ));
     }
-    let mut bytes = Vec::new();
-    fs::File::open(path)
-        .and_then(|file| file.take(MAX_BYTES + 1).read_to_end(&mut bytes))
-        .map_err(|error| format!("Cannot read playlist '{}': {error}", path.display()))?;
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err("Playlist exceeds size limit".into());
-    }
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| format!("Playlist '{}' is not valid UTF-8", path.display()))?;
+    let text = read_bounded_utf8(path, MAX_BYTES).map_err(|error| match error {
+        ReadError::Open(error) | ReadError::Read(error) => {
+            format!("Cannot read playlist '{}': {error}", path.display())
+        }
+        ReadError::TooLarge => "Playlist exceeds size limit".to_string(),
+        ReadError::Utf8 => format!("Playlist '{}' is not valid UTF-8", path.display()),
+    })?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     let mut entries = Vec::new();
     for (line_number, raw_line) in text.lines().enumerate() {

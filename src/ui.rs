@@ -18,6 +18,10 @@ use crossterm::{
 };
 use std::{
     io,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -67,11 +71,13 @@ fn effects_visible(width: u16, height: u16, mode: VisualMode) -> bool {
 }
 
 fn frame_interval(visible: bool, active: bool, animating: bool) -> Duration {
-    Duration::from_millis(if visible && (active || animating) {
-        33
+    if visible && (active || animating) {
+        Duration::from_millis(33)
     } else {
-        200
-    })
+        // Idle: the progress clock has one-second resolution and screen diffing
+        // already suppresses redundant writes.
+        Duration::from_secs(1)
+    }
 }
 
 /// Compact terminals retain a bar and remaining time; wide terminals also show elapsed/total.
@@ -174,6 +180,7 @@ struct View<'a> {
 fn draw(
     screen: &mut Screen,
     view: &View<'_>,
+    indices: Option<&[usize]>,
     visual: &Visualizer,
     canvas: &mut VisualCanvas,
     size: (u16, u16),
@@ -226,10 +233,14 @@ fn draw(
     } else {
         3
     };
-    let indices = view
-        .browser
-        .map(|b| b.indices(view.tracks, &player.queue))
-        .unwrap_or_else(|| (0..view.tracks.len()).collect());
+    let fallback: Vec<usize>;
+    let indices: &[usize] = match indices {
+        Some(indices) => indices,
+        None => {
+            fallback = (0..view.tracks.len()).collect();
+            &fallback
+        }
+    };
     let heading_text = if let Some(b) = view.browser {
         format!(
             "{} [{}] S:{} /{}{}",
@@ -355,16 +366,27 @@ pub fn run(
             .collect::<Vec<_>>()
             .join(" - ");
     }
+    let lower_titles: Vec<String> = tracks.iter().map(|t| t.title.to_lowercase()).collect();
+    let tracks = Arc::new(tracks);
     let mut playback = Playback::start(tracks.clone(), settings.volume, settings.repeat)
         .map_err(io::Error::other)?;
-    let initial = playback.snapshot();
-    let mut selected = initial.current.unwrap_or(0);
-    let mut last_current = initial.current;
-    let mut revision = initial.revision;
-    let mut seek_revision = initial.seek_revision;
+    let mut state = playback.snapshot();
+    let mut selected = state.current.unwrap_or(0);
+    let mut last_current = state.current;
+    let mut revision = state.revision;
+    let mut seek_revision = state.seek_revision;
     let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|info| {
-        restore();
+    let main_thread = std::thread::current().id();
+    let worker_panicked = Arc::new(AtomicBool::new(false));
+    let hook_panicked = worker_panicked.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        // Only the UI thread can safely restore the terminal; a panicked worker
+        // just flags the loop to exit, where TerminalGuard's drop restores it.
+        if std::thread::current().id() == main_thread {
+            restore();
+        } else {
+            hook_panicked.store(true, Ordering::Relaxed);
+        }
         eprintln!("StarPlay: {info}");
     }));
     let mut visual = Visualizer::default();
@@ -389,14 +411,24 @@ pub fn run(
         let mut previous_visible = false;
         let mut local_notice = String::new();
         loop {
-            let state = playback.snapshot();
+            if worker_panicked.load(Ordering::Relaxed) {
+                break;
+            }
+            // The worker publishes revisions lock-free; only clone the full state when
+            // something changed, or while playing (the position advances every wakeup).
+            let state_changed =
+                playback.revision() != revision || playback.seek_revision() != seek_revision;
+            if state_changed || !state.finished && !state.paused {
+                state = playback.snapshot();
+            }
             if state.current != lyric_track {
                 lyric_track = state.current;
                 lyrics = state
                     .current
-                    .and_then(|i| crate::media::Lyrics::load(&tracks[i].path).ok());
+                    .and_then(|i| tracks.get(i))
+                    .and_then(|track| crate::media::Lyrics::load(&track.path).ok());
             }
-            let indices = browser.indices(&tracks, &state.queue);
+            let indices = browser.indices(&lower_titles, &state.queue);
             browser.clamp(indices.len());
             selected = browser.cursor;
             if state.revision != revision {
@@ -431,7 +463,7 @@ pub fn run(
                     &state.audio,
                     visible && active,
                     state.volume,
-                    now.duration_since(last_update),
+                    now.saturating_duration_since(last_update),
                 );
                 last_update = now; // Includes drawing time in the next animation step.
                 let notice = if !local_notice.is_empty() {
@@ -455,6 +487,7 @@ pub fn run(
                             None
                         },
                     },
+                    Some(&indices),
                     &visual,
                     &mut canvas,
                     size,
@@ -468,7 +501,7 @@ pub fn run(
             // command results promptly, without forcing a redraw or FFT on every wakeup.
             let wait = next_draw
                 .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(20));
+                .min(Duration::from_millis(100));
             if !event::poll(wait)? {
                 continue;
             }
@@ -650,14 +683,8 @@ mod tests {
         assert!(!effects_visible(80, 24, VisualMode::Off));
         assert_eq!(frame_interval(true, true, false), Duration::from_millis(33));
         assert_eq!(frame_interval(true, false, true), Duration::from_millis(33));
-        assert_eq!(
-            frame_interval(true, false, false),
-            Duration::from_millis(200)
-        );
-        assert_eq!(
-            frame_interval(false, true, true),
-            Duration::from_millis(200)
-        );
+        assert_eq!(frame_interval(true, false, false), Duration::from_secs(1));
+        assert_eq!(frame_interval(false, true, true), Duration::from_secs(1));
     }
 
     #[test]
@@ -748,6 +775,7 @@ mod tests {
                         browser: None,
                         lyric: None,
                     },
+                    None,
                     &visual,
                     &mut canvas,
                     size,
@@ -781,6 +809,7 @@ mod tests {
                 browser: None,
                 lyric: None,
             },
+            None,
             &visual,
             &mut canvas,
             (80, 24),
@@ -798,6 +827,7 @@ mod tests {
                 browser: None,
                 lyric: None,
             },
+            None,
             &visual,
             &mut canvas,
             (80, 24),
@@ -832,6 +862,7 @@ mod tests {
                     browser: None,
                     lyric: None,
                 },
+                None,
                 &visual,
                 &mut canvas,
                 (80, 24),
@@ -850,6 +881,7 @@ mod tests {
                 browser: None,
                 lyric: None,
             },
+            None,
             &visual,
             &mut canvas,
             (80, 24),
@@ -920,8 +952,10 @@ mod tests {
         let mut visual = Visualizer::default();
         visual.mode = VisualMode::Off;
         let mut canvas = VisualCanvas::default();
+        let lower_titles: Vec<String> = tracks.iter().map(|t| t.title.to_lowercase()).collect();
         for queue in [false, true] {
             browser.queue = queue;
+            let indices = browser.indices(&lower_titles, &state.queue);
             draw(
                 &mut screen,
                 &View {
@@ -932,6 +966,7 @@ mod tests {
                     browser: Some(&browser),
                     lyric: Some("当前歌词"),
                 },
+                Some(&indices),
                 &visual,
                 &mut canvas,
                 (80, 24),
@@ -945,6 +980,7 @@ mod tests {
         }
         browser.queue = false;
         browser.query = "no matches".into();
+        let indices = browser.indices(&lower_titles, &state.queue);
         draw(
             &mut screen,
             &View {
@@ -955,6 +991,7 @@ mod tests {
                 browser: Some(&browser),
                 lyric: None,
             },
+            Some(&indices),
             &visual,
             &mut canvas,
             (32, 10),

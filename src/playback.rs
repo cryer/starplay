@@ -15,15 +15,19 @@ use crate::{
     player::{Player, Repeat},
 };
 use std::{
-    collections::hash_map::RandomState,
+    collections::{hash_map::RandomState, HashSet},
     hash::BuildHasher,
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 const COMMAND_CAPACITY: usize = 32;
 const TICK: Duration = Duration::from_millis(20);
+const HISTORY_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -83,15 +87,25 @@ impl PlaybackState {
 
 type Snapshot = Arc<Mutex<PlaybackState>>;
 
+/// Revision counters readable without locking the state, so the UI only clones
+/// the snapshot when something actually changed. Stores happen under the lock.
+#[derive(Default)]
+struct Revisions {
+    revision: AtomicU64,
+    seek_revision: AtomicU64,
+}
+
 /// Only brief state copies hold the mutex; decoding, seeking, commands and drawing never do.
 pub struct Playback {
     commands: Option<mpsc::SyncSender<Command>>,
     snapshot: Snapshot,
     worker: Option<JoinHandle<()>>,
+    revisions: Arc<Revisions>,
+    worker_died: AtomicBool,
 }
 
 impl Playback {
-    pub fn start(tracks: Vec<Track>, volume: u8, repeat: Repeat) -> Result<Self, String> {
+    pub fn start(tracks: Arc<Vec<Track>>, volume: u8, repeat: Repeat) -> Result<Self, String> {
         // Construct OutputStream inside the worker; it need not implement Send.
         Self::spawn(move || {
             if tracks.is_empty() {
@@ -117,8 +131,13 @@ impl Playback {
     {
         let (commands, receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let snapshot = Arc::new(Mutex::new(PlaybackState::empty(50, Repeat::Off)));
+        let snapshot = Arc::new(Mutex::new(PlaybackState::empty(
+            crate::config::DEFAULT_VOLUME,
+            Repeat::Off,
+        )));
+        let revisions = Arc::new(Revisions::default());
         let published = snapshot.clone();
+        let published_revisions = revisions.clone();
         let worker = thread::Builder::new()
             .name("starplay-playback".into())
             .spawn(move || {
@@ -130,11 +149,11 @@ impl Playback {
                     }
                 };
                 let mut engine = Engine::new(backend);
-                publish(&published, &engine.state);
+                publish(&published, &engine.state, &published_revisions);
                 if ready_tx.send(Ok(())).is_err() {
                     return;
                 }
-                worker_loop(&mut engine, receiver, &published);
+                worker_loop(&mut engine, receiver, &published, &published_revisions);
             })
             .map_err(|error| format!("Cannot start playback worker: {error}"))?;
         match ready_rx.recv() {
@@ -142,6 +161,8 @@ impl Playback {
                 commands: Some(commands),
                 snapshot,
                 worker: Some(worker),
+                revisions,
+                worker_died: AtomicBool::new(false),
             }),
             result => {
                 let _ = worker.join();
@@ -153,17 +174,38 @@ impl Playback {
         }
     }
 
+    /// Bump the published revision once if the worker died, so the UI notices
+    /// without locking; later calls are no-ops instead of perpetual redraws.
+    fn notice_worker_death(&self) {
+        if self.commands.is_some()
+            && self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+            && !self.worker_died.swap(true, Ordering::AcqRel)
+        {
+            self.revisions.revision.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.notice_worker_death();
+        self.revisions.revision.load(Ordering::Acquire)
+    }
+
+    pub fn seek_revision(&self) -> u64 {
+        self.revisions.seek_revision.load(Ordering::Acquire)
+    }
+
     pub fn snapshot(&self) -> PlaybackState {
+        self.notice_worker_death();
         let mut state = self
             .snapshot
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if self.commands.is_some() && self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+        if self.worker_died.load(Ordering::Acquire) {
             state.finished = true;
             state.notice =
                 "Playback worker stopped unexpectedly. Quit and restart the player.".into();
-            state.revision = state.revision.wrapping_add(1);
+            state.revision = self.revisions.revision.load(Ordering::Acquire);
         }
         state
     }
@@ -233,7 +275,6 @@ impl Backend for Player {
         match command {
             Command::Play(index) => self.play(index),
             Command::TogglePause(index) => self.toggle_pause(index),
-            Command::Skip(forward) => self.skip(forward),
             Command::Seek(seconds) => self.seek(seconds),
             Command::ChangeVolume(delta) => {
                 self.change_volume(delta);
@@ -243,7 +284,8 @@ impl Backend for Player {
                 self.repeat = self.repeat.next();
                 Ok(())
             }
-            Command::ToggleShuffle
+            Command::Skip(_)
+            | Command::ToggleShuffle
             | Command::Enqueue(_)
             | Command::RemoveQueued(_)
             | Command::ClearQueue => unreachable!("navigation is owned by Engine"),
@@ -300,6 +342,9 @@ impl<B: Backend> Engine<B> {
         if previous != current {
             if let Some(index) = previous {
                 self.history.push(index);
+                if self.history.len() > HISTORY_LIMIT {
+                    self.history.remove(0);
+                }
             }
         }
         if self.state.shuffle {
@@ -317,10 +362,13 @@ impl<B: Backend> Engine<B> {
         let mut last_error = None;
         // Every queued entry is attempted once, even under repeat-one. A failed entry
         // must not wedge future Next/EOF transitions behind an unplayable queue head.
-        while !self.state.queue.is_empty() {
-            let index = self.state.queue.remove(0);
+        let queued = std::mem::take(&mut self.state.queue);
+        for (position, index) in queued.iter().copied().enumerate() {
             match self.play(index) {
-                Ok(()) => return Ok(true),
+                Ok(()) => {
+                    self.state.queue = queued[position + 1..].to_vec();
+                    return Ok(true);
+                }
                 Err(error) => last_error = Some(error),
             }
         }
@@ -333,7 +381,7 @@ impl<B: Backend> Engine<B> {
             }
         }
         if self.state.shuffle {
-            let mut failed = Vec::new();
+            let mut failed = HashSet::new();
             for _ in 0..count {
                 if self.shuffle_bag.is_empty() {
                     if automatic && self.state.repeat != Repeat::All {
@@ -352,7 +400,7 @@ impl<B: Backend> Engine<B> {
                     Ok(()) => return Ok(true),
                     Err(error) => {
                         last_error = Some(error);
-                        failed.push(index);
+                        failed.insert(index);
                     }
                 }
             }
@@ -513,17 +561,20 @@ impl<B: Backend> Engine<B> {
     }
 }
 
-fn publish(snapshot: &Snapshot, state: &PlaybackState) {
-    snapshot
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone_from(state);
+fn publish(snapshot: &Snapshot, state: &PlaybackState, revisions: &Revisions) {
+    let mut guard = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+    guard.clone_from(state);
+    revisions.revision.store(state.revision, Ordering::Release);
+    revisions
+        .seek_revision
+        .store(state.seek_revision, Ordering::Release);
 }
 
 fn worker_loop<B: Backend>(
     engine: &mut Engine<B>,
     receiver: mpsc::Receiver<Command>,
     snapshot: &Snapshot,
+    revisions: &Revisions,
 ) {
     let mut next_tick = Instant::now() + TICK;
     loop {
@@ -532,7 +583,7 @@ fn worker_loop<B: Backend>(
             match receiver.try_recv() {
                 Ok(command) => {
                     engine.command(command);
-                    publish(snapshot, &engine.state);
+                    publish(snapshot, &engine.state, revisions);
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return,
@@ -541,13 +592,13 @@ fn worker_loop<B: Backend>(
         let now = Instant::now();
         if now >= next_tick {
             engine.tick();
-            publish(snapshot, &engine.state);
+            publish(snapshot, &engine.state, revisions);
             next_tick = Instant::now() + TICK;
         }
         match receiver.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
             Ok(command) => {
                 engine.command(command);
-                publish(snapshot, &engine.state);
+                publish(snapshot, &engine.state, revisions);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -1172,6 +1223,8 @@ mod tests {
             commands: Some(tx),
             snapshot: Arc::new(Mutex::new(PlaybackState::empty(50, Repeat::Off))),
             worker: None,
+            revisions: Arc::new(Revisions::default()),
+            worker_died: AtomicBool::new(false),
         };
         for _ in 0..COMMAND_CAPACITY {
             playback.send(Command::CycleRepeat).unwrap();
