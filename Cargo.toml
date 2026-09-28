@@ -1,0 +1,10 @@
+[package]
+name = "starplay"
+version = "0.1.0"
+edition = "2021"
+description = "A small terminal music player for Windows Terminal and CMD"
+
+[dependencies]
+crossterm = "0.28"
+unicode-width = "0.2"
+rodio = { version = "0.20", default-features = false, features = ["mp3", "wav", "flac", "vorbis"] }

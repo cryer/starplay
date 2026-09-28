@@ -1,0 +1,5 @@
+/target/
+/.star/
+/.starplay-library-test-*/
+/.starplay.conf
+/.starplay.conf.*.tmp
