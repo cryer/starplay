@@ -349,9 +349,7 @@ mod tests {
     fn retired_effects_migrate_without_losing_preferences() {
         let fixture = Fixture::new();
         for mode in ["waveform", "stereo", "field"] {
-            fixture.write(&format!(
-                "version=1\nvolume=73\nrepeat=one\nvisual={mode}\n"
-            ));
+            fixture.write(format!("version=1\nvolume=73\nrepeat=one\nvisual={mode}\n"));
             let settings = load(&fixture.config()).unwrap();
             assert_eq!(settings.visual_mode, VisualMode::Spectrum);
             assert_eq!(settings.volume, 73);

@@ -398,7 +398,11 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let fixture = Fixture::new();
         let path = fixture.0.join(OsString::from_vec(b"song\xff.mp3".to_vec()));
-        fs::write(&path, b"").unwrap();
+        // macOS filesystems reject non-UTF-8 names with EILSEQ; nothing to test there.
+        if fs::write(&path, b"").is_err() {
+            eprintln!("non-UTF-8 test skipped: filesystem rejects non-UTF-8 names");
+            return;
+        }
         let tracks = discover(std::slice::from_ref(&path), false).unwrap();
         assert_eq!(tracks[0].path, fs::canonicalize(path).unwrap());
         assert_eq!(tracks[0].title, "song\u{fffd}");
